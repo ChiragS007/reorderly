@@ -21,7 +21,7 @@ export default function App() {
     <AppProvider embedded apiKey={apiKey}>
       <PolarisAppProvider i18n={en}>
         <s-app-nav>
-          <s-link href="/app">Today&apos;s Reorder</s-link>
+          <s-link href="/app">Today's reorder list</s-link>
         </s-app-nav>
         <Outlet />
       </PolarisAppProvider>

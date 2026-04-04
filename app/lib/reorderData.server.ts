@@ -28,6 +28,9 @@ const LINE_ITEMS_QUERY = `#graphql
             variant {
               id
               sku
+              product {
+                isGiftCard
+              }
             }
           }
         }
@@ -36,9 +39,11 @@ const LINE_ITEMS_QUERY = `#graphql
   }
 `;
 
+const CATALOG_PRODUCTS_QUERY = "status:active";
+
 const PRODUCTS_QUERY = `#graphql
-  query ReorderlyProducts($cursor: String) {
-    products(first: 50, after: $cursor) {
+  query ReorderlyProducts($cursor: String, $query: String!) {
+    products(first: 50, query: $query, after: $cursor) {
       pageInfo {
         hasNextPage
         endCursor
@@ -47,6 +52,8 @@ const PRODUCTS_QUERY = `#graphql
         node {
           id
           title
+          status
+          isGiftCard
           variants(first: 100) {
             pageInfo {
               hasNextPage
@@ -115,7 +122,10 @@ async function fetchAllOrderLineItems(
             edges: Array<{
               node: {
                 quantity: number;
-                variant: { id: string } | null;
+                variant: {
+                  id: string;
+                  product?: { isGiftCard: boolean } | null;
+                } | null;
               };
             }>;
           };
@@ -125,8 +135,10 @@ async function fetchAllOrderLineItems(
     const conn = j.data?.order?.lineItems;
     if (!conn) break;
     for (const e of conn.edges) {
-      const vid = e.node.variant?.id;
+      const v = e.node.variant;
+      const vid = v?.id;
       if (!vid) continue;
+      if (v.product?.isGiftCard) continue;
       out.push({ quantity: e.node.quantity, variantId: vid });
     }
     if (!conn.pageInfo.hasNextPage) break;
@@ -144,12 +156,15 @@ export async function fetchReorderSourceData(admin: AdminWithGraphql): Promise<{
     currentInventory: number;
   }>;
   variantCount: number;
+  ordersInLast30Days: number;
+  variantsWithSales: number;
 }> {
   const start = new Date();
   start.setUTCDate(start.getUTCDate() - 30);
   const ordersQuery = `created_at:>=${ymdUTC(start)}`;
 
   const variantSales = new Map<string, number>();
+  let ordersInLast30Days = 0;
 
   let orderCursor: string | null = null;
   for (;;) {
@@ -157,6 +172,7 @@ export async function fetchReorderSourceData(admin: AdminWithGraphql): Promise<{
       variables: { query: ordersQuery, cursor: orderCursor },
     });
     const body = (await res.json()) as {
+      errors?: Array<{ message: string }>;
       data?: {
         orders?: {
           pageInfo: { hasNextPage: boolean; endCursor: string | null };
@@ -165,10 +181,18 @@ export async function fetchReorderSourceData(admin: AdminWithGraphql): Promise<{
       };
     };
 
+    if (body.errors?.length) {
+      console.error(
+        "Reorderly orders query:",
+        body.errors.map((e) => e.message).join("; "),
+      );
+    }
+
     const conn = body.data?.orders;
     if (!conn) break;
 
     for (const edge of conn.edges) {
+      ordersInLast30Days += 1;
       const lines = await fetchAllOrderLineItems(admin, edge.node.id);
       for (const row of lines) {
         variantSales.set(
@@ -187,18 +211,23 @@ export async function fetchReorderSourceData(admin: AdminWithGraphql): Promise<{
     quantity,
   }));
 
-  const productVariants: Array<{
+  const variantRows: Array<{
     productTitle: string;
     variantId: string;
     sku: string | null;
     currentInventory: number;
+    isGiftCard: boolean;
+    productStatus: string;
   }> = [];
-  let variantCount = 0;
 
   let productCursor: string | null = null;
+  console.log(
+    "[Reorderly] Starting product fetch with query:",
+    CATALOG_PRODUCTS_QUERY,
+  );
   for (;;) {
     const pres = await admin.graphql(PRODUCTS_QUERY, {
-      variables: { cursor: productCursor },
+      variables: { cursor: productCursor, query: CATALOG_PRODUCTS_QUERY },
     });
     const pbody = (await pres.json()) as {
       data?: {
@@ -208,6 +237,8 @@ export async function fetchReorderSourceData(admin: AdminWithGraphql): Promise<{
             node: {
               id: string;
               title: string;
+              status: string;
+              isGiftCard: boolean;
               variants: {
                 pageInfo: { hasNextPage: boolean; endCursor: string | null };
                 edges: Array<{
@@ -225,23 +256,36 @@ export async function fetchReorderSourceData(admin: AdminWithGraphql): Promise<{
     };
 
     const pconn = pbody.data?.products;
-    if (!pconn) break;
+    if (!pconn) {
+      console.error(
+        "[Reorderly] Products query returned no data. Raw response:",
+        JSON.stringify(pbody).slice(0, 500),
+      );
+      break;
+    }
+    console.log(
+      "[Reorderly] Products page fetched:",
+      pconn.edges.length,
+      "products",
+    );
 
     for (const pe of pconn.edges) {
       const p = pe.node;
+
       const collectVariantPage = async (
         edges: typeof p.variants.edges,
         hasNext: boolean,
         endCursor: string | null,
       ) => {
         for (const ve of edges) {
-          variantCount += 1;
           const n = ve.node;
-          productVariants.push({
+          variantRows.push({
             productTitle: p.title,
             variantId: n.id,
             sku: n.sku,
             currentInventory: n.inventoryQuantity ?? 0,
+            isGiftCard: p.isGiftCard,
+            productStatus: p.status,
           });
         }
         if (!hasNext) return;
@@ -269,13 +313,14 @@ export async function fetchReorderSourceData(admin: AdminWithGraphql): Promise<{
           const vc = vj.data?.product?.variants;
           if (!vc) break;
           for (const ve of vc.edges) {
-            variantCount += 1;
             const n = ve.node;
-            productVariants.push({
+            variantRows.push({
               productTitle: p.title,
               variantId: n.id,
               sku: n.sku,
               currentInventory: n.inventoryQuantity ?? 0,
+              isGiftCard: p.isGiftCard,
+              productStatus: p.status,
             });
           }
           if (!vc.pageInfo.hasNextPage) break;
@@ -294,5 +339,30 @@ export async function fetchReorderSourceData(admin: AdminWithGraphql): Promise<{
     productCursor = pconn.pageInfo.endCursor;
   }
 
-  return { ordersAggregated, productVariants, variantCount };
+  const productVariants = variantRows
+    .filter((v) => !v.isGiftCard && v.productStatus === "ACTIVE")
+    .map(({ productTitle, variantId, sku, currentInventory }) => ({
+      productTitle,
+      variantId,
+      sku,
+      currentInventory,
+    }));
+  const variantCount = productVariants.length;
+
+  const variantsWithSales = variantSales.size;
+
+  console.log(
+    "[Reorderly] Final counts — variants:",
+    productVariants.length,
+    "orders:",
+    ordersInLast30Days,
+  );
+
+  return {
+    ordersAggregated,
+    productVariants,
+    variantCount,
+    ordersInLast30Days,
+    variantsWithSales,
+  };
 }

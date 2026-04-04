@@ -6,11 +6,21 @@ export function serializeReorderRow(row) {
     variant_id: row.variant_id,
     sku: row.sku,
     current_inventory: row.current_inventory,
+    last_30_days_sales: row.last_30_days_sales,
     daily_sales: row.daily_sales,
     days_left: Number.isFinite(row.days_left) ? row.days_left : null,
+    reorder_point: row.reorder_point,
     reorder_qty: row.reorder_qty,
-    urgency: row.urgency,
+    status: row.status,
   };
+}
+
+/** JSON has no Infinity; enforce finite `days_left` or null on every API response. */
+export function reorderItemsJsonSafe(items) {
+  return items.map((item) => ({
+    ...item,
+    days_left: Number.isFinite(item.days_left) ? item.days_left : null,
+  }));
 }
 
 export function computeReorderItems(
@@ -23,5 +33,9 @@ export function computeReorderItems(
     lead_time_days: leadTimeDays,
     buffer_pct: bufferPct,
   });
-  return rows.map(serializeReorderRow);
+  const safeItems = rows.map((item) => ({
+    ...item,
+    days_left: Number.isFinite(item.days_left) ? item.days_left : null,
+  }));
+  return safeItems.map(serializeReorderRow);
 }

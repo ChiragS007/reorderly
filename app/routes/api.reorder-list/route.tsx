@@ -5,21 +5,32 @@ import {
   REORDERLY_MONTHLY_PLAN,
   authenticate,
 } from "../../shopify.server";
+import { REORDERLY_FREE_VARIANT_LIMIT } from "../../lib/reorderly.constants";
 import {
   getReorderCache,
   reorderCacheKey,
   setReorderCache,
 } from "../../../web/lib/reorderCache.js";
-import { computeReorderItems } from "../../../web/routes/api.js";
+import {
+  computeReorderItems,
+  reorderItemsJsonSafe,
+} from "../../../web/routes/api.js";
 
 const ALLOWED_LEAD = new Set([7, 14, 30]);
 const ALLOWED_BUFFER = new Set([0.1, 0.2, 0.3]);
+
+function shopAdminNav(shop: string) {
+  return {
+    adminProductsUrl: `https://${shop}/admin/products`,
+    adminInventoryUrl: `https://${shop}/admin/products/inventory`,
+  };
+}
 
 async function billingBlocked(
   variantCount: number,
   billing: Awaited<ReturnType<typeof authenticate.admin>>["billing"],
 ): Promise<boolean> {
-  if (variantCount <= 25) return false;
+  if (variantCount <= REORDERLY_FREE_VARIANT_LIMIT) return false;
   const { hasActivePayment } = await billing.check({
     // shopifyApp billing keys are widened in typings; runtime plan id is REORDERLY_MONTHLY_PLAN.
     plans: [REORDERLY_MONTHLY_PLAN] as never,
@@ -30,6 +41,7 @@ async function billingBlocked(
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { admin, session, billing } = await authenticate.admin(request);
+  console.log("[Reorderly] /api/reorder-list called for shop:", session.shop);
   const shop = session.shop;
 
   const url = new URL(request.url);
@@ -47,31 +59,58 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   const cached = getReorderCache(cacheKey) as null | {
     items: ReturnType<typeof computeReorderItems>;
     variantCount: number;
+    dataQuality: {
+      ordersInLast30Days: number;
+      variantsWithSales: number;
+    };
   };
+
+  const nav = shopAdminNav(shop);
 
   if (cached) {
     const blocked = await billingBlocked(cached.variantCount, billing);
     return Response.json({
-      items: blocked ? [] : cached.items,
+      ...nav,
+      items: reorderItemsJsonSafe(blocked ? [] : cached.items),
       variantCount: cached.variantCount,
       billingBlocked: blocked,
       leadTimeDays,
       bufferPct,
+      dataQuality: cached.dataQuality ?? {
+        ordersInLast30Days: 0,
+        variantsWithSales: 0,
+      },
     });
   }
 
   try {
-    const { ordersAggregated, productVariants, variantCount } =
-      await fetchReorderSourceData(admin);
+    const {
+      ordersAggregated,
+      productVariants,
+      variantCount,
+      ordersInLast30Days,
+      variantsWithSales,
+    } = await fetchReorderSourceData(admin);
+
+    console.log(
+      "[Reorderly] Source data — variantCount:",
+      variantCount,
+      "ordersInLast30Days:",
+      ordersInLast30Days,
+    );
+
+    const dataQuality = { ordersInLast30Days, variantsWithSales };
 
     const blocked = await billingBlocked(variantCount, billing);
     if (blocked) {
       return Response.json({
+        ...nav,
         items: [],
         variantCount,
         billingBlocked: true,
         leadTimeDays,
         bufferPct,
+        dataQuality,
       });
     }
 
@@ -81,14 +120,16 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       leadTimeDays,
       bufferPct,
     );
-    setReorderCache(cacheKey, { items, variantCount });
+    setReorderCache(cacheKey, { items, variantCount, dataQuality });
 
     return Response.json({
-      items,
+      ...nav,
+      items: reorderItemsJsonSafe(items),
       variantCount,
       billingBlocked: false,
       leadTimeDays,
       bufferPct,
+      dataQuality,
     });
   } catch (e) {
     console.error("reorder-list", e);
